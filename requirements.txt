@@ -1,0 +1,5 @@
+ibm-watson
+ibm-cloud-sdk-core
+ibm-watsonx-ai
+requests
+python-dotenv
