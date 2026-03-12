@@ -1,120 +1,74 @@
-import argparse
+# Este arquivo e o ponto de entrada da aplicacao.
+# Ele faz a orquestracao do pipeline usando os modulos auxiliares:
+# resolve argumentos, valida configuracao, chama STT, chama watsonx
+# e dispara a gravacao dos outputs gerados pelos demais componentes.
+
+import os
 from pathlib import Path
+import argparse
+from time import perf_counter
 
 from dotenv import load_dotenv
-import os
+from watsonx_analysis.config import (
+    PROMPT_PADRAO,
+    detectar_content_type,
+    listar_audios_disponiveis,
+    resolver_llm_model,
+    resolver_stt_model,
+)
+from watsonx_analysis.observability import log_etapa_fim, log_etapa_inicio
+from watsonx_analysis.parsing import extrair_json_resposta, validar_analise_estruturada
+from watsonx_analysis.prompt_utils import carregar_template_prompt, montar_prompt
+from watsonx_analysis.services import analisar_ligacao, transcrever_audio_ibm
+from watsonx_analysis.storage import (
+    formatar_relatorio_analise,
+    montar_saida_estruturada,
+    salvar_json,
+    salvar_qa_consolidado_csv,
+    salvar_qa_csv,
+    salvar_texto,
+)
 
 load_dotenv()
-
-# IBM SPEECH TO TEXT
-from ibm_watson import SpeechToTextV1
-from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
-
-# IBM WATSONX
-from ibm_watsonx_ai import Credentials
-from ibm_watsonx_ai.foundation_models import ModelInference
-
-# SALVAR ARQUIVOS
-def salvar_texto(texto: str, caminho: Path):
-    """Salva texto em arquivo, criando pastas se necessário."""
-    try:
-        caminho.parent.mkdir(parents=True, exist_ok=True)
-        with open(caminho, "w", encoding="utf-8") as f:
-            f.write(texto)
-        print(f"✔ Arquivo salvo: {caminho}")
-    except Exception as e:
-        print(f"❌ Erro ao salvar arquivo {caminho}: {e}")
-
-
-# 1. TRANSCRIÇÃO COM IBM STT
-def transcrever_audio_ibm(caminho_audio: Path, api_key: str, url: str) -> str:
-    """Transcreve áudio usando IBM Speech-to-Text."""
-
-    print(f"🎙️ Transcrevendo áudio: {caminho_audio}")
-
-    try:
-        authenticator = IAMAuthenticator(api_key)
-        stt = SpeechToTextV1(authenticator=authenticator)
-        stt.set_service_url(url)
-
-        with open(caminho_audio, "rb") as audio:
-            resultado = stt.recognize(
-                audio=audio,
-                content_type="audio/mp3",
-                model="pt-BR_NarrowbandModel"
-            ).get_result()
-
-        texto = " ".join(
-            item["alternatives"][0]["transcript"]
-            for item in resultado["results"]
-        )
-
-        return texto.strip()
-
-    except Exception as e:
-        raise RuntimeError(f"❌ Erro ao transcrever áudio: {e}")
-
-
-# 2. ANÁLISE Q&A COM WATSONX
-def analisar_ligacao(transcricao: str, api_key: str, url: str, project_id: str) -> str:
-    """Gera análise Q&A da ligação em TEXTO NORMAL."""
-
-    prompt = f"""
-Você é um especialista em atendimento ao cliente da Stellantis Financiamentos.
-
-Sua tarefa é analisar a transcrição de uma ligação entre cliente e atendente e transformar o conteúdo em uma base de conhecimento no formato de perguntas e respostas (Q&A).
-
-Regras:
-- Extraia as principais dúvidas do cliente.
-- Converta cada dúvida em uma pergunta clara.
-- Escreva a resposta baseada no que foi explicado pelo atendente.
-- Use linguagem clara e institucional.
-- Se o cliente mencionou um processo da empresa, transforme isso em um guia explicativo.
-
-Formato da resposta:
-
-Pergunta:
-<pergunta clara sobre o processo>
-
-Resposta:
-<explicação completa e institucional sobre como realizar o processo>
-
-TRANSCRIÇÃO:
-{transcricao}
-"""
-
-    try:
-        creds = Credentials(url=url, api_key=api_key)
-
-        model = ModelInference(
-            model_id="meta-llama/llama-3-3-70b-instruct",
-            credentials=creds,
-            project_id=project_id
-        )
-
-        resposta = model.generate_text(
-            prompt=prompt,
-            params={
-                "decoding_method": "greedy",
-                "temperature": 0,
-                "max_new_tokens": 1200
-            }
-        )
-
-        return resposta.strip()
-
-    except Exception as e:
-        raise RuntimeError(f"❌ Erro ao gerar análise: {e}")
 
 
 # MAIN
 
 def main():
     parser = argparse.ArgumentParser(description="Transcrever e analisar ligação")
-    parser.add_argument("audio", nargs="?", default="antecipacao2.mp3")
+    parser.add_argument("audio", nargs="?", help="Caminho para o arquivo de audio a ser processado")
+    parser.add_argument(
+        "--prompt-file",
+        default=str(PROMPT_PADRAO),
+        help="Caminho para o arquivo de prompt usado na analise",
+    )
+    parser.add_argument(
+        "--stt-model",
+        help="Modelo do IBM Speech to Text para a transcricao",
+    )
+    parser.add_argument(
+        "--llm-model",
+        help="Modelo do watsonx usado na analise",
+    )
     args = parser.parse_args()
 
+    if not args.audio:
+        audios_disponiveis = listar_audios_disponiveis(Path.cwd())
+        print("❌ Nenhum arquivo de audio foi informado.")
+
+        if audios_disponiveis:
+            # Quando o usuario esquece o argumento, a CLI tenta orientar o proximo comando.
+            print("\nArquivos de audio encontrados na pasta atual:")
+            for audio in audios_disponiveis:
+                print(f"- {audio.name}")
+            print(f"\nExemplo de uso:\npython app.py {audios_disponiveis[0].name}")
+        else:
+            print("\nNenhum arquivo de audio foi encontrado na pasta atual.")
+            print("Exemplo de uso:\npython app.py caminho/para/audio.mp3")
+        return 1
+
     caminho_audio = Path(args.audio)
+    caminho_prompt = Path(args.prompt_file)
 
     if not caminho_audio.exists():
         print(f"❌ Arquivo não encontrado: {caminho_audio}")
@@ -128,23 +82,119 @@ def main():
     PROJECT_ID = os.getenv("PROJECT_ID")
 
     if not all([API_KEY_STT, STT_URL, API_KEY_WX, WATSONX_URL, PROJECT_ID]):
-        print("❌ Configure as variáveis no arquivo .env (use .env.example como referência)")
+        print("❌ Configure as variáveis obrigatórias no arquivo .env")
         return 1
 
     try:
+        inicio_total = perf_counter()
+        log_etapa_inicio(
+            "Processamento do audio",
+            f"arquivo={caminho_audio.name}",
+        )
+
         # 1) TRANSCRIÇÃO BRUTA
-        transcricao_bruta = transcrever_audio_ibm(caminho_audio, API_KEY_STT, STT_URL)
+        content_type = detectar_content_type(caminho_audio)
+        stt_model = resolver_stt_model(args.stt_model)
+        llm_model = resolver_llm_model(args.llm_model)
+        log_etapa_inicio(
+            "Transcricao com IBM STT",
+            f"content_type={content_type} | stt_model={stt_model}",
+        )
+        inicio_transcricao = perf_counter()
+        transcricao_bruta = transcrever_audio_ibm(
+            caminho_audio,
+            API_KEY_STT,
+            STT_URL,
+            content_type,
+            stt_model,
+        )
+        tempo_transcricao_segundos = round(perf_counter() - inicio_transcricao, 2)
+        log_etapa_fim(
+            "Transcricao com IBM STT",
+            f"tempo={tempo_transcricao_segundos}s",
+        )
         salvar_texto(transcricao_bruta, Path(f"output/{caminho_audio.stem}_01_transcricao.txt"))
 
-        # 2) ANÁLISE Q&A DIRETA
-        analise = analisar_ligacao(
-            transcricao_bruta,
+        # 2) ANALISE ESTRUTURADA
+        # O prompt eh carregado de arquivo para facilitar manutencao e testes de variacao.
+        log_etapa_inicio(
+            "Preparacao do prompt",
+            f"prompt_file={caminho_prompt}",
+        )
+        template_prompt = carregar_template_prompt(caminho_prompt)
+        prompt_final = montar_prompt(template_prompt, transcricao_bruta)
+        log_etapa_fim("Preparacao do prompt")
+
+        log_etapa_inicio(
+            "Inferencia com watsonx",
+            f"llm_model={llm_model}",
+        )
+        inicio_inferencia = perf_counter()
+        resposta_modelo = analisar_ligacao(
+            prompt_final,
             API_KEY_WX,
             WATSONX_URL,
-            PROJECT_ID
+            PROJECT_ID,
+            llm_model,
         )
-        salvar_texto(analise, Path(f"output/{caminho_audio.stem}_02_analise.txt"))
+        tempo_inferencia_segundos = round(perf_counter() - inicio_inferencia, 2)
+        log_etapa_fim(
+            "Inferencia com watsonx",
+            f"tempo={tempo_inferencia_segundos}s",
+        )
 
+        log_etapa_inicio("Validacao da resposta do modelo")
+        try:
+            analise_json = extrair_json_resposta(resposta_modelo)
+        except RuntimeError:
+            salvar_texto(
+                resposta_modelo,
+                Path(f"output/{caminho_audio.stem}_resposta_modelo_bruta.txt"),
+            )
+            raise
+        analise_validada = validar_analise_estruturada(analise_json)
+        log_etapa_fim("Validacao da resposta do modelo")
+
+        tempo_total_segundos = round(perf_counter() - inicio_total, 2)
+        saida_estruturada = montar_saida_estruturada(
+            caminho_audio,
+            caminho_prompt,
+            content_type,
+            stt_model,
+            llm_model,
+            transcricao_bruta,
+            analise_validada,
+            tempo_transcricao_segundos,
+            tempo_inferencia_segundos,
+            tempo_total_segundos,
+        )
+
+        log_etapa_inicio("Gravacao dos arquivos de saida")
+        salvar_json(saida_estruturada, Path(f"output/{caminho_audio.stem}_02_analise.json"))
+
+        relatorio = formatar_relatorio_analise(saida_estruturada)
+        salvar_texto(relatorio, Path(f"output/{caminho_audio.stem}_03_relatorio.txt"))
+        salvar_qa_csv(
+            saida_estruturada["analise"]["perguntas_respostas"],
+            Path(f"output/{caminho_audio.stem}_04_qa.csv"),
+        )
+        salvar_qa_consolidado_csv(
+            saida_estruturada,
+            Path(f"output/{caminho_audio.stem}_05_qa_consolidado.csv"),
+        )
+        log_etapa_fim("Gravacao dos arquivos de saida")
+
+        print(
+            "\n⏱️ Tempos de execucao:\n"
+            f"- Transcricao: {tempo_transcricao_segundos}s\n"
+            f"- Inferencia: {tempo_inferencia_segundos}s\n"
+            f"- Total: {tempo_total_segundos}s"
+        )
+
+        log_etapa_fim(
+            "Processamento do audio",
+            f"tempo_total={tempo_total_segundos}s",
+        )
         print("\n🎉 Processo concluído com sucesso!\n")
 
     except RuntimeError as e:

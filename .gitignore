@@ -23,3 +23,11 @@ build/
 
 # Output
 output/
+
+# Audio
+audios/
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
